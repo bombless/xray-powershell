@@ -1,0 +1,35 @@
+{
+  "log": {
+    "loglevel": "warning",
+    "access": "logs/access.log",
+    "error": "logs/error.log"
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {
+        "udp": true
+      }
+    },
+    {
+      "tag": "http-in",
+      "listen": "127.0.0.1",
+      "port": 10809,
+      "protocol": "http",
+      "settings": {}
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": []
+  }
+}
