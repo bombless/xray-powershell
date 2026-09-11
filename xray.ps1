@@ -43,8 +43,8 @@ function Read-Nodes {
     $raw = Get-Content -LiteralPath $NodesPath -Raw -Encoding UTF8
     if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
     $value = $raw | ConvertFrom-Json
-    if ($value -is [System.Array]) { return @($value) }
-    return @($value)
+    if ($value -is [System.Array]) { return ,@($value) }
+    return ,@($value)
 }
 
 function Save-Nodes($Nodes) {
@@ -167,40 +167,70 @@ function New-NodeFromUri([string]$UriText, [int]$Id) {
 
 function Parse-Subscription([string]$Content) {
     $text = $Content.Trim()
-    $decoded = ConvertTo-Base64Text $text
-    if ($decoded -and $decoded -match '(?im)^(vless|vmess|trojan|ss)://') { $text = $decoded }
+    # v2rayA returns a Base64-wrapped list of vmess:// lines. Decode only when
+    # the response itself is not already a URI list.
+    if ($text -notmatch '(?im)^(?:vless|vmess|trojan|ss)://') {
+        $candidate = ConvertTo-Base64Text $text
+        if ($candidate -and $candidate -match '(?im)^(?:vless|vmess|trojan|ss)://') { $text = $candidate }
+    }
+
     $nodes = @(); $id = 1
     foreach ($line in ($text -split "`r?`n")) {
         $line = $line.Trim()
         if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) { continue }
+
+        if ($line -match '^vmess://') {
+            $json = ConvertTo-Base64Text ($line.Substring(8))
+            if (-not $json) { Write-Log 'Failed to Base64-decode VMess entry.'; continue }
+            try {
+                $v = $json | ConvertFrom-Json
+                $name = if ($null -ne $v.ps -and -not [string]::IsNullOrWhiteSpace([string]$v.ps)) { [string]$v.ps } else { "Node-$id" }
+                $nodes += [pscustomobject][ordered]@{
+                    id=$id; name=$name; protocol='vmess'; address=[string]$v.add; port=[int]$v.port; uuid=[string]$v.id
+                    alterId=$(if ($null -ne $v.aid) {[int]$v.aid} else {0}); security='auto'
+                    network=$(if ($v.net) {[string]$v.net} else {'tcp'}); tls=$(if ($v.tls) {[string]$v.tls} else {''})
+                    type=$(if ($v.type) {[string]$v.type} else {'none'}); host=$(if ($v.host) {[string]$v.host} else {''})
+                    path=$(if ($v.path) {[string]$v.path} else {''}); serverName=$(if ($v.sni) {[string]$v.sni} else {''})
+                    alpn=$(if ($v.alpn) {[string]$v.alpn} else {''}); fp=$(if ($v.fp) {[string]$v.fp} else {''})
+                }
+                $id++
+            } catch { Write-Log "Failed to parse VMess JSON: $($_.Exception.Message)" }
+            continue
+        }
+
         if ($line -match '^vless://|^trojan://') {
             $node = New-NodeFromUri $line $id
             if ($node) { $nodes += $node; $id++ }
             continue
         }
-        if ($line -match '^vmess://') {
-            $json = ConvertTo-Base64Text ($line.Substring(8))
-            if ($json) {
-                try {
-                    $v = $json | ConvertFrom-Json
-                    $nodes += [pscustomobject][ordered]@{ id=$id; name=$(if ($v.pscustomObject.psobject.Properties.Name -contains 'ps') {$v.ps} else {"Node-$id"}); protocol='vmess'; address=$v.add; port=[int]$v.port; uuid=$v.id; security=$(if ($v.aid) {'auto'} else {'auto'}); network=$v.net; tls=$v.tls; serverName=$v.sni; path=$v.path; host=$v.host }
-                    $id++
-                } catch { Write-Log "Failed to parse VMess node: $line" }
-            }
-            continue
-        }
     }
-    return @($nodes)
+    return ,@($nodes)
 }
-
 function Update-Subscription {
     if ([string]::IsNullOrWhiteSpace($SubscriptionUrl)) { throw 'Specify -SubscriptionUrl when updating, or configure it in data/subscription-url.txt.' }
     Initialize-Directories
     Write-Host 'Updating subscription...'
-    $response = Invoke-WebRequest -Uri $SubscriptionUrl -Headers @{ 'User-Agent'='Mozilla/5.0 xray-powershell' } -UseBasicParsing
-    $content = [string]$response.Content
+    $request = [System.Net.HttpWebRequest]::Create($SubscriptionUrl)
+    $request.Method = 'GET'
+    $request.UserAgent = 'v2rayA/debug WebRequestHelper'
+    $request.AutomaticDecompression =
+        [System.Net.DecompressionMethods]::GZip -bor
+        [System.Net.DecompressionMethods]::Deflate
+
+    $response = $request.GetResponse()
+
+    try {
+        $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+        $content = $reader.ReadToEnd()
+    }
+    finally {
+        if ($reader) { $reader.Dispose() }
+        $response.Dispose()
+    }
     Set-Content -LiteralPath $SubscriptionPath -Value $content -Encoding UTF8
     $nodes = Parse-Subscription $content
+    Write-Log "Subscription HTTP status=$($response.StatusCode) bytes=$([Text.Encoding]::UTF8.GetByteCount($content)) parsedNodes=$($nodes.Count)"
+    if ($nodes.Count -eq 0) { throw 'Subscription returned no supported nodes.' }
     Save-Nodes $nodes
     Write-Host "Parsed $($nodes.Count) nodes."
 }
@@ -213,10 +243,31 @@ function Show-Nodes {
 
 function New-XrayOutbound($Node) {
     switch ($Node.protocol) {
+        'vmess' {
+            $network = if ($Node.network) { [string]$Node.network } else { 'tcp' }
+            $security = if ($Node.tls -eq 'tls') { 'tls' } else { 'none' }
+            $stream = [ordered]@{ network=$network; security=$security }
+            if ($security -eq 'tls') {
+                $tlsSettings = [ordered]@{}
+                if ($Node.serverName) { $tlsSettings.serverName = [string]$Node.serverName }
+                if ($Node.fp) { $tlsSettings.fingerprint = [string]$Node.fp }
+                $stream.tlsSettings = $tlsSettings
+            }
+            if ($network -eq 'ws') {
+                $ws = [ordered]@{}
+                if ($Node.path) { $ws.path = [string]$Node.path }
+                if ($Node.host) { $ws.headers = [ordered]@{ Host=[string]$Node.host } }
+                $stream.wsSettings = $ws
+            }
+            $user = [ordered]@{ id=[string]$Node.uuid; alterId=$(if ($null -ne $Node.alterId) {[int]$Node.alterId} else {0}); security='auto' }
+            return [ordered]@{ protocol='vmess'; settings=[ordered]@{ vnext=@([ordered]@{ address=[string]$Node.address; port=[int]$Node.port; users=@($user) }) }; streamSettings=$stream }
+        }
+
         'vless' {
             $stream = [ordered]@{ network=$(if ($Node.type) {$Node.type} else {'tcp'}); security=$(if ($Node.security) {$Node.security} else {'none'}) }
             if ($Node.security -eq 'tls') { $stream.tlsSettings = [ordered]@{ serverName=$Node.sni; fingerprint=$Node.fp } }
             if ($Node.security -eq 'reality') { $stream.realitySettings = [ordered]@{ serverName=$Node.sni; fingerprint=$(if($Node.fp){$Node.fp}else{'chrome'}); publicKey=$Node.pbk; shortId=$Node.sid } }
+            if ($stream.network -eq 'ws') { $ws = [ordered]@{}; if ($Node.path) { $ws.path=$Node.path }; if ($Node.host) { $ws.headers=[ordered]@{ Host=$Node.host } }; $stream.wsSettings=$ws }
             $settings = [ordered]@{ vnext=@([ordered]@{ address=$Node.address; port=[int]$Node.port; users=@([ordered]@{ id=$Node.uuid; encryption='none'; flow=$(if($Node.flow){$Node.flow}else{''}) }) }) }
             return [ordered]@{ protocol='vless'; settings=$settings; streamSettings=$stream }
         }
