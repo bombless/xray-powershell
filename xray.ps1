@@ -147,7 +147,7 @@ function New-NodeFromUri([string]$UriText, [int]$Id) {
     try { $uri = [Uri]$UriText } catch { return $null }
     $query = Parse-Query $uri.Query.TrimStart('?')
     $name = if ($uri.Fragment) { [Uri]::UnescapeDataString($uri.Fragment.TrimStart('#')) } else { "Node-$Id" }
-    $node = [ordered]@{ id=$Id; name=$name; protocol=$scheme; address=$uri.Host; port=$uri.Port }
+    $node = [ordered]@{ id=$Id; name=$name; protocol=$scheme; address=$uri.Host; port=$uri.Port; active=$false }
 
     switch ($scheme) {
         'vless' {
@@ -186,7 +186,7 @@ function Parse-Subscription([string]$Content) {
                 $v = $json | ConvertFrom-Json
                 $name = if ($null -ne $v.ps -and -not [string]::IsNullOrWhiteSpace([string]$v.ps)) { [string]$v.ps } else { "Node-$id" }
                 $nodes += [pscustomobject][ordered]@{
-                    id=$id; name=$name; protocol='vmess'; address=[string]$v.add; port=[int]$v.port; uuid=[string]$v.id
+                    id=$id; name=$name; protocol='vmess'; address=[string]$v.add; port=[int]$v.port; uuid=[string]$v.id; active=$false
                     alterId=$(if ($null -ne $v.aid) {[int]$v.aid} else {0}); security='auto'
                     network=$(if ($v.net) {[string]$v.net} else {'tcp'}); tls=$(if ($v.tls) {[string]$v.tls} else {''})
                     type=$(if ($v.type) {[string]$v.type} else {'none'}); host=$(if ($v.host) {[string]$v.host} else {''})
@@ -272,7 +272,7 @@ function New-XrayOutbound($Node) {
             return [ordered]@{ protocol='vless'; settings=$settings; streamSettings=$stream }
         }
         'trojan' {
-            return [ordered]@{ protocol='trojan'; settings=[ordered]@{ servers=@([ordered]@{ address=$Node.address; port=[int]$Node.port; password=$Node.password }) }; streamSettings=[ordered]@{ network=$(if($Node.type){$Node.type}else{'tcp'}); security=$(if($Node.security){$Node.security}else{'tls'}); tlsSettings=[ordered]@{ serverName=$Node.sni } } }
+            return [ordered]@{ protocol='trojan'; settings=[ordered]@{ servers=@([ordered]@{ address=$Node.address; port=$Node.port; password=$Node.password }) }; streamSettings=[ordered]@{ network=$(if($Node.type){$Node.type}else{'tcp'}); security=$(if($Node.security){$Node.security}else{'tls'}); tlsSettings=[ordered]@{ serverName=$Node.sni } } }
         }
         default { throw "Unsupported protocol: $($Node.protocol)" }
     }
@@ -295,7 +295,15 @@ function Select-Node([int]$NodeId) {
     $nodes = Read-Nodes
     $node = $nodes | Where-Object { [int]$_.id -eq $NodeId } | Select-Object -First 1
     if ($null -eq $node) { throw "Node $NodeId not found." }
-    foreach ($n in $nodes) { $n.active = ([int]$n.id -eq $NodeId) }
+    foreach ($n in $nodes) {
+        # ConvertFrom-Json returns PSCustomObject instances whose properties are
+        # fixed after deserialization. Older nodes.json files may not have the
+        # active property at all, so assignment alone throws under StrictMode.
+        if ($null -eq $n.PSObject.Properties['active']) {
+            $n | Add-Member -MemberType NoteProperty -Name 'active' -Value $false
+        }
+        $n.active = ([int]$n.id -eq $NodeId)
+    }
     Save-Nodes $nodes
     Write-ConfigForNode $node
     Write-Host "Selected: $($node.name)"
@@ -319,41 +327,45 @@ function Test-Node([int]$NodeId) {
 
 function Test-AllNodes([Nullable[int]]$OnlyId) {
     $nodes = Read-Nodes
-    if ($OnlyId.HasValue) { $nodes = @($nodes | Where-Object { [int]$_.id -eq $OnlyId.Value }) }
-    foreach ($node in $nodes) { Test-Node ([int]$node.id) }
+    if ($nodes.Count -eq 0) { throw 'No nodes. Run update first.' }
+    $targets = if ($null -ne $OnlyId) { @($nodes | Where-Object { [int]$_.id -eq $OnlyId }) } else { @($nodes) }
+    if ($targets.Count -eq 0) { throw "Node $OnlyId not found." }
+    foreach ($target in $targets) {
+        try {
+            Write-ConfigForNode $target
+            if (Get-XrayProcess) { Stop-Xray }
+            Start-Xray
+            Test-Node ([int]$target.id)
+        } catch {
+            [pscustomobject]@{ Node=$target.name; PingMs=$null; Success=$false }
+        }
+    }
 }
 
 function Show-Help {
-    @'
-PowerShell Xray Manager
-
-Usage:
-  .\xray.ps1 start
-  .\xray.ps1 stop
-  .\xray.ps1 restart
-  .\xray.ps1 status
-  .\xray.ps1 update -SubscriptionUrl <url>
-  .\xray.ps1 list
-  .\xray.ps1 test [N]
-  .\xray.ps1 select N
-  .\xray.ps1 current
-
-The first version intentionally keeps the controller in one PowerShell file.
-Place xray.exe beside xray.ps1.
-'@ | Write-Host
+    Write-Host @'
+xray.ps1 commands:
+  update -SubscriptionUrl <url>  Update and parse subscription
+  list                            List nodes
+  select <id>                     Select a node and restart Xray
+  current                         Show selected node
+  status                          Show Xray status
+  test [id]                       Test one/all nodes
+  stop                            Stop Xray
+  start                           Start Xray
+  restart                         Restart Xray
+'@
 }
 
-Initialize-Directories
 switch ($Command.ToLowerInvariant()) {
-    'start' { Start-Xray }
-    'stop' { Stop-Xray }
-    'restart' { Restart-Xray }
-    'status' { Show-Status }
-    'update' { Update-Subscription }
-    'list' { Show-Nodes }
-    'test' { if ($Index -gt 0) { Test-Node $Index } else { Test-AllNodes $null } }
-    'select' { if ($Index -le 0) { throw 'Usage: .\xray.ps1 select N' }; Select-Node $Index }
-    'current' { Show-Current }
-    'help' { Show-Help }
-    default { Show-Help; exit 1 }
+    'update'   { Update-Subscription }
+    'list'     { Show-Nodes }
+    'select'   { Select-Node $Index }
+    'current'  { Show-Current }
+    'status'   { Show-Status }
+    'test'     { if ($Index -gt 0) { Test-AllNodes $Index } else { Test-AllNodes $null } }
+    'start'    { Start-Xray }
+    'stop'     { Stop-Xray }
+    'restart'  { Restart-Xray }
+    default    { Show-Help }
 }
