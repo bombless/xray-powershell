@@ -24,6 +24,7 @@ $PidPath = Join-Path $DataDir 'xray.pid'
 $SubscriptionPath = Join-Path $DataDir 'subscription.txt'
 $LogDir = Join-Path $Root 'logs'
 $LogPath = Join-Path $LogDir 'xray.log'
+$ErrorLogPath = Join-Path $LogDir 'xray-error.log'
 
 function Initialize-Directories {
     foreach ($path in @($ConfigDir, $DataDir, $LogDir)) {
@@ -73,10 +74,10 @@ function Get-XrayProcess {
     return $process
 }
 
-function Test-TcpPort([string]$Host, [int]$Port) {
+function Test-TcpPort([string]$HostName, [int]$Port) {
     $client = [System.Net.Sockets.TcpClient]::new()
     try {
-        $task = $client.ConnectAsync($Host, $Port)
+        $task = $client.ConnectAsync($HostName, $Port)
         if (-not $task.Wait(500)) { return $false }
         return $client.Connected
     } catch { return $false } finally { $client.Dispose() }
@@ -96,7 +97,7 @@ function Start-Xray {
     if (Test-TcpPort '127.0.0.1' 10809) { throw 'HTTP port 10809 is already in use.' }
 
     Initialize-Directories
-    $process = Start-Process -FilePath $XrayPath -ArgumentList @('run','-c',$ConfigPath) -WorkingDirectory $Root -RedirectStandardOutput $LogPath -RedirectStandardError $LogPath -PassThru
+    $process = Start-Process -FilePath $XrayPath -ArgumentList @('run','-c',$ConfigPath) -WorkingDirectory $Root -RedirectStandardOutput $LogPath -RedirectStandardError $ErrorLogPath -PassThru
     Set-Content -LiteralPath $PidPath -Value $process.Id -Encoding ASCII
     Write-Log "Started Xray PID=$($process.Id)"
     Write-Host "Xray started. PID: $($process.Id)"
@@ -369,3 +370,7 @@ switch ($Command.ToLowerInvariant()) {
     'restart'  { Restart-Xray }
     default    { Show-Help }
 }
+
+
+
+
